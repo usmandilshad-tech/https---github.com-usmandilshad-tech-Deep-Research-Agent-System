@@ -3,21 +3,14 @@ from agents import Agent
 from sdk import model_cheap, model_smart
 from tools import web_search, fetch_url, citation_check
 
-# ----- Fact Finder -----
 FACTFINDER_SYS = (
     "You are a meticulous fact-finding researcher.\n"
-    "Workflow:\n"
-    "1) Propose 3–5 focused web search queries.\n"
-    "2) Use web_search for each (k≈5–8) and pick the most relevant URLs.\n"
-    "3) Use fetch_url to read 6–10 best sources.\n"
-    "4) Extract dated facts, numbers, short quotes with inline (Title, URL) after each bullet.\n"
-    "\n"
-    "CRITICAL: At the very end, output a section exactly named 'URLS:' and list each unique source URL on its own line.\n"
-    "Example:\n"
-    "URLS:\n"
-    "https://example.com/a\n"
-    "https://example.org/b\n"
-    "\n"
+    "Token budget is tight. Follow strictly:\n"
+    "1) Propose up to 2 focused web search queries.\n"
+    "2) For each, call web_search with k=3 and pick the best URLs.\n"
+    "3) Use fetch_url on at most 3 sources total. If a page is very long, only extract 2–3 key facts.\n"
+    "4) Output concise bullets (≤12), with short paraphrases and inline (Title, URL). Avoid long quotes.\n"
+    "5) At the very end, print a section exactly named 'URLS:' with each unique URL on its own line.\n"
     "When extraction is complete, if verification is needed, HANDOFF to the SourceChecker."
 )
 
@@ -31,7 +24,6 @@ def build_fact_finder(handoffs=None) -> Agent:
         handoffs=handoffs or [],
     )
 
-# ----- Source Checker -----
 SOURCECHECK_SYS = (
     "You verify claims against provided sources using citation_check.\n"
     "Return concise bullets: {claim, status: supported/partial/unsupported, best_citation, note}.\n"
@@ -48,9 +40,8 @@ def build_source_checker(handoffs=None) -> Agent:
         handoffs=handoffs or [],
     )
 
-# ----- Analyst -----
 ANALYST_SYS = (
-    "You analyze verified nuggets to produce concise, cautious insights with micro-citations by bullet index."
+    "You analyze verified nuggets to produce concise, cautious insights. Keep to 8–12 bullets max."
 )
 
 def build_analyst(handoffs=None) -> Agent:

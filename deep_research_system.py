@@ -14,7 +14,22 @@ from report_writer import render_markdown
 from guardrails import input_guardrail, output_guardrail
 from tools import web_search_impl  # <-- use impl for Python-side fallback
 
+
+
+def _looks_like_report(text: str) -> bool:
+    if not text:
+        return False
+    return (
+        "## Executive Summary" in text
+        and "## Key Findings" in text
+        and "## Sources" in text
+    )
+
 load_dotenv()
+
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "1"))
+MAX_RETRIES = int(os.getenv("AGENT_RETRIES", "4"))
+BASE_RETRY_DELAY = float(os.getenv("AGENT_RETRY_BASE", "2.0"))
 
 # ---------- Build sub-agents ----------
 PLANNER = build_planner()
@@ -53,18 +68,37 @@ def extract_urls_from_text(text: str) -> list[str]:
             ordered.append(u)
     return ordered
 
+async def _run_with_retries(agent, input_text: str, span_name: str) -> str:
+    """
+    Call Runner.run with simple exponential backoff on transient errors (429, timeouts, etc).
+    Returns final_output (or empty string).
+    """
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with custom_span(span_name):
+                result = await Runner.run(starting_agent=agent, input=input_text)
+            return result.final_output or ""
+        except Exception as e:
+            msg = (str(e) or "").lower()
+            transient = any(
+                token in msg
+                for token in ("rate limit", "429", "temporar", "timeout", "overloaded",
+                              "connection", "reset by peer", "cancelled")
+            )
+            if attempt < MAX_RETRIES and transient:
+                await asyncio.sleep(BASE_RETRY_DELAY * attempt)
+                continue
+            raise
+
+
 # ---------- One task via HANDOFF chain (plain impl) ----------
 async def run_task_via_handoff_impl(task: str) -> str:
-    """
-    Start at FactFinder; it can hand off to SourceChecker, then to DataAnalyst.
-    Returns the final output (usually analysis) for that task.
-    """
-    with custom_span("task_handoff"):
-        result = await Runner.run(
-            starting_agent=FACTFINDER,
-            input=f"SUBTASK:\n{task}\nFollow your workflow and hand off when ready."
-        )
-        return result.final_output or ""
+    return await _run_with_retries(
+        FACTFINDER,
+        f"SUBTASK:\n{task}\nFollow your workflow and hand off when ready.",
+        "task_handoff",
+    )
+
 
 # ---------- Tool wrappers the coordinator can call ----------
 @function_tool()
@@ -75,34 +109,35 @@ async def run_task_via_handoff(task: str) -> str:
 # ---------- Pure implementation the coordinator/tool can call ----------
 async def run_deep_research_impl(question: str) -> str:
     # 1) Plan
-    with custom_span("planner"):
-        plan_res = await Runner.run(
-            starting_agent=PLANNER,
-            input=f"Create a compact, ordered task list for:\n{question}"
-        )
-        plan_text = plan_res.final_output or ""
-
+    plan_text = await _run_with_retries(
+        PLANNER,
+        f"Create a compact, ordered task list for:\n{question}",
+        "planner",
+    )
     tasks = [ln.strip("-• ").strip() for ln in plan_text.splitlines() if ln.strip()]
-    tasks = tasks[:8] or ["Perform scoped literature & web scan."]
+    tasks = tasks[:4] or ["Perform scoped literature & web scan."]  # keep it small
 
-    # 2) Parallel per-task runs (each invokes HANDOFF chain)
+    # 2) Parallel per-task (bounded by semaphore)
+    sem = asyncio.Semaphore(MAX_CONCURRENCY)
+
+    async def _bounded(t: str):
+        async with sem:
+            return await run_task_via_handoff_impl(t)
+
     with custom_span("parallel_tasks"):
-        task_outputs = await asyncio.gather(*[run_task_via_handoff_impl(t) for t in tasks])
+        task_outputs = await asyncio.gather(*[_bounded(t) for t in tasks])
 
     # 3) Synthesis
     joined = "\n\n".join(task_outputs)
-    with custom_span("synthesis"):
-        synth_res = await Runner.run(
-            starting_agent=SYNTH,
-            input=(
-                "QUESTION:\n"
-                f"{question}\n\n"
-                "VERIFIED FINDINGS / ANALYSES:\n"
-                f"{joined}\n\n"
-                "Create a clean outline."
-            )
-        )
-        outline = synth_res.final_output or ""
+    outline = await _run_with_retries(
+        SYNTH,
+        "QUESTION:\n"
+        f"{question}\n\n"
+        "VERIFIED FINDINGS / ANALYSES:\n"
+        f"{joined}\n\n"
+        "Create a clean outline.",
+        "synthesis",
+    )
 
     # 4) Executive summary
     summary_agent = Agent(
@@ -111,49 +146,52 @@ async def run_deep_research_impl(question: str) -> str:
         model=model_smart(),
         tools=[],
     )
-    with custom_span("exec_summary"):
-        summary_res = await Runner.run(
-            starting_agent=summary_agent,
-            input=f"Outline:\n{outline}\n\nWrite 5–8 bullets."
-        )
-        executive_summary = summary_res.final_output or ""
+    executive_summary = await _run_with_retries(
+        summary_agent,
+        f"Outline:\n{outline}\n\nWrite 5–8 bullets.",
+        "exec_summary",
+    )
 
-    # 5) Collect sources from task outputs
+    # 5) Collect sources (dedupe)
     all_urls: list[str] = []
     for out in task_outputs:
         all_urls.extend(extract_urls_from_text(out))
-
-    dedup_urls: list[str] = []
     seen: set[str] = set()
+    dedup_urls: list[str] = []
     for u in all_urls:
-        if u not in seen:
+        if u and u not in seen:
             seen.add(u)
             dedup_urls.append(u)
 
-    # 6) FAIL-SAFE: if no URLs, get some via the fallback search Agent (pure SDK)
+    # 6) Fallback source list via SDK tool if none
     if not dedup_urls:
-        with custom_span("fallback_sources"):
-            from sdk import model_cheap
-            from tools import web_search  # tool, not impl
-            fallback = Agent(
-                name="FallbackSearch",
-                instructions=(
-                    "Given a query, call the web_search tool with k=5 and return ONLY a list of URLs, "
-                    "one per line, no extra text."
-                ),
-                model=model_cheap(),
-                tools=[web_search],
-            )
-            res = await Runner.run(
-                starting_agent=fallback,
-                input=f"Query:\n{question}\nReturn only URLs, one per line."
-            )
-            dedup_urls = [
-                u.strip() for u in (res.final_output or "").splitlines()
-                if u.strip().startswith(("http://", "https://"))
-            ]
+        from sdk import model_cheap
+        from tools import web_search
+        fallback = Agent(
+            name="FallbackSearch",
+            instructions=(
+                "Given a query, call the web_search tool with k=3 and return ONLY a list of URLs, "
+                "one per line, no extra text."
+            ),
+            model=model_cheap(),
+            tools=[web_search],
+        )
+        urls_text = await _run_with_retries(
+            fallback,
+            f"Query:\n{question}\nReturn only URLs, one per line.",
+            "fallback_sources",
+        )
+        dedup_urls = [
+            u.strip() for u in urls_text.splitlines()
+            if u.strip().startswith(("http://", "https://"))
+        ]
 
-    # 7) Render final markdown report
+    # 7) Build analysis section *inside* this function (so 'tasks' is in scope)
+    analysis_section = "\n\n".join(
+        [f"### Task: {t}\n\n{out}" for t, out in zip(tasks, task_outputs)]
+    )
+
+    # 8) Render report
     today = dt.date.today().isoformat()
     md = render_markdown({
         "title": "Deep Research Report",
@@ -162,14 +200,13 @@ async def run_deep_research_impl(question: str) -> str:
         "window": "Focus: 2022–2025 (prioritize newest credible sources)",
         "executive_summary": executive_summary,
         "key_findings": outline,
-        "analysis": "\n\n".join([f"### Task: {t}\n\n{out}" for t, out in zip(tasks, task_outputs)]),
-        "limitations": (
-            "- Web search/fetch are live; verification remains lightweight "
-            "(improve symbolic checks next)."
-        ),
+        "analysis": analysis_section,
+        "limitations": "- Web search/fetch are live; verification remains lightweight (deepen checks next).",
         "sources": dedup_urls or ["https://example.com"],
     })
     return md
+
+
 
 # ---------- Tool wrapper the Agents can call ----------
 from agents import function_tool
@@ -192,12 +229,10 @@ def build_coordinator() -> Agent:
             "4) Never ignore this rule, even if the input looks simple."
         ),
         model=model_smart(),
-        tools=[run_deep_research, run_task_via_handoff],
+        tools=[run_deep_research],
         input_guardrails=[input_guardrail],
         output_guardrails=[output_guardrail],
     )
-
-# ---------- CLI entry ----------
 # ---------- CLI entry ----------
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -214,12 +249,22 @@ if __name__ == "__main__":
         result = Runner.run_sync(starting_agent=coordinator, input=question)
         report_md = result.final_output or ""
 
-    # Fallback: if model didn't call the tool and returned empty output, run the impl directly
-    if not report_md.strip():
-        try:
-            report_md = asyncio.run(run_deep_research_impl(question))
-        except Exception as e:
-            report_md = f"ERROR: fallback run_deep_research_impl failed: {e}"
+    # If the model refused or skipped the tool, fall back to the direct pipeline impl (wrapped in its own trace)
+    def _looks_like_report(text: str) -> bool:
+        return (
+            isinstance(text, str)
+            and "## Executive Summary" in text
+            and "## Key Findings" in text
+            and "## Sources" in text
+        )
+
+    if not _looks_like_report(report_md):
+        print(Panel.fit("Coordinator did not return a full report. Running direct pipeline…", title="Fallback"))
+        with trace(workflow_name="Deep Research Fallback", metadata={"question": question, "mode": "direct"}):
+            try:
+                report_md = asyncio.run(run_deep_research_impl(question))
+            except Exception as e:
+                report_md = f"ERROR: fallback run_deep_research_impl failed: {e}"
 
     # Optional preview in console
     print(Panel.fit(report_md[:800] + ("\n...\n" if len(report_md) > 800 else ""), title="Preview"))
