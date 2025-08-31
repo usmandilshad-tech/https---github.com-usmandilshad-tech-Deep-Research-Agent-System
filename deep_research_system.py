@@ -1,136 +1,228 @@
+# deep_research_system.py
 from __future__ import annotations
-import os, sys, datetime as dt
+import os, sys, datetime as dt, asyncio, re
 from dotenv import load_dotenv
 from rich import print
 from rich.panel import Panel
 
-# --- OpenAI Agents SDK (async client + tracing) ---
-from openai import AsyncOpenAI
-from agents import (
-    Agent,
-    Runner,
-    function_tool,
-    trace,
-    set_default_openai_client,
-    OpenAIResponsesModel,  # model wrapper for Responses API
-)
-
-# --- your modules ---
-from planning_agent import make_plan
-from research_agents import (
-    FactFinderAgent,
-    SourceCheckerAgent,
-    DataAnalystAgent,
-    SearchTool,
-    DocLoaderTool,
-    CitationCheckerTool,
-)
-from synthesis_agent import synthesize_outline
+from agents import Agent, Runner, function_tool, trace, custom_span
+from sdk import model_smart
+from planning_agent import build_planner
+from research_agents import build_fact_finder, build_source_checker, build_analyst
+from synthesis_agent import build_synthesizer
 from report_writer import render_markdown
+from guardrails import input_guardrail, output_guardrail
+from tools import web_search_impl  # <-- use impl for Python-side fallback
 
 load_dotenv()
 
-# register a SINGLE async OpenAI client for the Agents SDK
-external_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-set_default_openai_client(external_client)
+# ---------- Build sub-agents ----------
+PLANNER = build_planner()
+FACTFINDER = build_fact_finder()
+CHECKER   = build_source_checker()
+ANALYST   = build_analyst()
+SYNTH     = build_synthesizer()
 
-# ---- simple injectable tools (replace with real implementations) ----
-class DummySearch(SearchTool):
-    def run(self, query: str, k: int = 8):
-        return []
+# ---------- Handoff chain (FF -> CHECKER -> ANALYST) ----------
+FACTFINDER.handoffs = [CHECKER]
+CHECKER.handoffs    = [ANALYST]
+# ANALYST ends the chain
 
-class DummyLoader(DocLoaderTool):
-    def fetch(self, url: str) -> str:
-        return ""
+# ---------- Helpers ----------
+URL_RE = re.compile(r"https?://[^\s)>\]]+", re.IGNORECASE)
 
-class DummyChecker(CitationCheckerTool):
-    pass
+def extract_urls_from_text(text: str) -> list[str]:
+    """Pull raw URLs and those listed under a trailing 'URLS:' block."""
+    urls = URL_RE.findall(text or "")
+    block_urls: list[str] = []
+    if text:
+        lower = text.lower()
+        idx = lower.rfind("urls:")
+        if idx != -1:
+            tail = text[idx + 5:]
+            for line in tail.splitlines():
+                line = line.strip()
+                if line.startswith("http://") or line.startswith("https://"):
+                    block_urls.append(line)
+    # dedupe, preserve order
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for u in urls + block_urls:
+        if u and u not in seen:
+            seen.add(u)
+            ordered.append(u)
+    return ordered
 
-# ---- your existing pipeline kept synchronous under the hood ----------
-def run_research(question: str) -> str:
-    print(Panel.fit(f"[bold]Deep Research[/bold]\n{question}", title="Lead Researcher"))
+# ---------- One task via HANDOFF chain (plain impl) ----------
+async def run_task_via_handoff_impl(task: str) -> str:
+    """
+    Start at FactFinder; it can hand off to SourceChecker, then to DataAnalyst.
+    Returns the final output (usually analysis) for that task.
+    """
+    with custom_span("task_handoff"):
+        result = await Runner.run(
+            starting_agent=FACTFINDER,
+            input=f"SUBTASK:\n{task}\nFollow your workflow and hand off when ready."
+        )
+        return result.final_output or ""
 
-    # 1) plan
-    plan = make_plan(question)
-    print(Panel.fit("\n".join(plan.high_level), title="High-level Plan"))
-    print(Panel.fit("\n".join(plan.tasks), title="Task List"))
+# ---------- Tool wrappers the coordinator can call ----------
+@function_tool()
+async def run_task_via_handoff(task: str) -> str:
+    return await run_task_via_handoff_impl(task)
 
-    # 2) research agents
-    fact_finder = FactFinderAgent(search=DummySearch(), loader=DummyLoader())
-    checker = SourceCheckerAgent(checker=DummyChecker())
-    analyst = DataAnalystAgent()
 
-    nuggets, all_urls = [], []
+# ---------- Pure implementation the coordinator/tool can call ----------
+async def run_deep_research_impl(question: str) -> str:
+    # 1) Plan
+    with custom_span("planner"):
+        plan_res = await Runner.run(
+            starting_agent=PLANNER,
+            input=f"Create a compact, ordered task list for:\n{question}"
+        )
+        plan_text = plan_res.final_output or ""
 
-    for i, task in enumerate(plan.tasks, start=1):
-        print(Panel.fit(task, title=f"Task {i}"))
-        pack = fact_finder.research(task, k=6)
-        nuggets.append(pack["extracted"])
-        urls = [r.get("url", "") for r in pack["results"] if r.get("url")]
-        all_urls.extend(urls)
+    tasks = [ln.strip("-• ").strip() for ln in plan_text.splitlines() if ln.strip()]
+    tasks = tasks[:8] or ["Perform scoped literature & web scan."]
 
-    # 3) verify & analyze
-    verified = checker.verify("\n\n".join(nuggets), list(dict.fromkeys(all_urls)))
-    analysis = analyst.analyze(verified)
+    # 2) Parallel per-task runs (each invokes HANDOFF chain)
+    with custom_span("parallel_tasks"):
+        task_outputs = await asyncio.gather(*[run_task_via_handoff_impl(t) for t in tasks])
 
-    # 4) synthesize outline
-    outline = synthesize_outline(question, verified)
+    # 3) Synthesis
+    joined = "\n\n".join(task_outputs)
+    with custom_span("synthesis"):
+        synth_res = await Runner.run(
+            starting_agent=SYNTH,
+            input=(
+                "QUESTION:\n"
+                f"{question}\n\n"
+                "VERIFIED FINDINGS / ANALYSES:\n"
+                f"{joined}\n\n"
+                "Create a clean outline."
+            )
+        )
+        outline = synth_res.final_output or ""
 
-    # 5) write report
+    # 4) Executive summary
+    summary_agent = Agent(
+        name="ExecutiveSummarizer",
+        instructions="Write 5–8 crisp bullets strictly grounded in the outline.",
+        model=model_smart(),
+        tools=[],
+    )
+    with custom_span("exec_summary"):
+        summary_res = await Runner.run(
+            starting_agent=summary_agent,
+            input=f"Outline:\n{outline}\n\nWrite 5–8 bullets."
+        )
+        executive_summary = summary_res.final_output or ""
+
+    # 5) Collect sources from task outputs
+    all_urls: list[str] = []
+    for out in task_outputs:
+        all_urls.extend(extract_urls_from_text(out))
+
+    dedup_urls: list[str] = []
+    seen: set[str] = set()
+    for u in all_urls:
+        if u not in seen:
+            seen.add(u)
+            dedup_urls.append(u)
+
+    # 6) FAIL-SAFE: if no URLs, get some via the fallback search Agent (pure SDK)
+    if not dedup_urls:
+        with custom_span("fallback_sources"):
+            from sdk import model_cheap
+            from tools import web_search  # tool, not impl
+            fallback = Agent(
+                name="FallbackSearch",
+                instructions=(
+                    "Given a query, call the web_search tool with k=5 and return ONLY a list of URLs, "
+                    "one per line, no extra text."
+                ),
+                model=model_cheap(),
+                tools=[web_search],
+            )
+            res = await Runner.run(
+                starting_agent=fallback,
+                input=f"Query:\n{question}\nReturn only URLs, one per line."
+            )
+            dedup_urls = [
+                u.strip() for u in (res.final_output or "").splitlines()
+                if u.strip().startswith(("http://", "https://"))
+            ]
+
+    # 7) Render final markdown report
+    today = dt.date.today().isoformat()
     md = render_markdown({
         "title": "Deep Research Report",
-        "date": dt.date.today().isoformat(),
+        "date": today,
         "author": "Deep Research Agent",
-        "window": "Focus: 2022–2025 (prioritized newest credible sources)",
-        "executive_summary": "TODO: Add 5–8 bullet executive summary from outline+analysis.",
+        "window": "Focus: 2022–2025 (prioritize newest credible sources)",
+        "executive_summary": executive_summary,
         "key_findings": outline,
-        "analysis": analysis,
-        "limitations": "- Some sources are placeholders until real web/search tools are connected.\n- Citations should be re-checked after integrating live fetch.",
-        "sources": list(dict.fromkeys(all_urls)) or ["(No links collected — implement SearchTool/DocLoader)"],
+        "analysis": "\n\n".join([f"### Task: {t}\n\n{out}" for t, out in zip(tasks, task_outputs)]),
+        "limitations": (
+            "- Web search/fetch are live; verification remains lightweight "
+            "(improve symbolic checks next)."
+        ),
+        "sources": dedup_urls or ["https://example.com"],
     })
     return md
 
-# ---- expose your pipeline as a tool for the Agent to call ----------
-@function_tool()
-def run_pipeline(question: str) -> str:
-    """
-    Tool: executes the full deep research pipeline and returns a Markdown report.
-    """
-    return run_research(question)
+# ---------- Tool wrapper the Agents can call ----------
+from agents import function_tool
 
+@function_tool()
+async def run_deep_research(question: str) -> str:
+    return await run_deep_research_impl(question)
+
+
+# ---------- Coordinator (strict tool invoker) ----------
+def build_coordinator() -> Agent:
+    return Agent(
+        name="LeadResearcher",
+        instructions=(
+            "You are an orchestration-only agent.\n"
+            "CRITICAL RULES:\n"
+            "1) Upon ANY user input, you MUST immediately call the `run_deep_research` tool with the full input string.\n"
+            "2) DO NOT write your own answer or commentary.\n"
+            "3) Return EXACTLY the tool's output as your final message.\n"
+            "4) Never ignore this rule, even if the input looks simple."
+        ),
+        model=model_smart(),
+        tools=[run_deep_research, run_task_via_handoff],
+        input_guardrails=[input_guardrail],
+        output_guardrails=[output_guardrail],
+    )
+
+# ---------- CLI entry ----------
+# ---------- CLI entry ----------
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("[red]Usage:[/red] uv run python deep_research_system.py \"your question here\"")
         sys.exit(1)
 
     question = sys.argv[1]
+    coordinator = build_coordinator()
 
-    # Construct a model wrapper for the coordinator agent
-    llm_model = OpenAIResponsesModel(
-        model=os.getenv("MODEL_SMART", "gpt-4o"),
-        openai_client=external_client,  # async client required by Agents SDK loop
-    )
+    print(Panel.fit(f"[bold]Deep Research[/bold]\n{question}", title="Coordinator"))
 
-    # Coordinator agent that simply calls the tool with the user question
-    lead = Agent(
-        name="Lead Researcher",
-        instructions=(
-            "You coordinate deep research. When given a question, call the "
-            "`run_pipeline` tool with the full question to produce a complete report."
-        ),
-        model=llm_model,
-        tools=[run_pipeline],
-    )
+    # First try: Coordinator run (pure SDK; shows up in Traces)
+    with trace(workflow_name="Deep Research Run", metadata={"question": question, "app": os.getenv("ENV", "local")}):
+        result = Runner.run_sync(starting_agent=coordinator, input=question)
+        report_md = result.final_output or ""
 
-    # ✅ tracing: the whole run will appear in OpenAI → Traces
-    with trace(workflow_name="Deep Research Run", metadata={"question": question, "app": "DSAS"}):
-        result = Runner.run_sync(
-            starting_agent=lead,
-            input=question
-        )
+    # Fallback: if model didn't call the tool and returned empty output, run the impl directly
+    if not report_md.strip():
+        try:
+            report_md = asyncio.run(run_deep_research_impl(question))
+        except Exception as e:
+            report_md = f"ERROR: fallback run_deep_research_impl failed: {e}"
 
-    # The tool returns Markdown text as the final output
-    report_md = result.output_text
+    # Optional preview in console
+    print(Panel.fit(report_md[:800] + ("\n...\n" if len(report_md) > 800 else ""), title="Preview"))
 
     out = "report.md"
     with open(out, "w", encoding="utf-8") as f:

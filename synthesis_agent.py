@@ -1,23 +1,17 @@
-from openai import OpenAI
-import os
-from dotenv import load_dotenv
+# synthesis_agent.py
+from agents import Agent
+from sdk import model_smart
 
-load_dotenv()
-
-_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-
-
-SYSTEM = (
-    "You are a synthesis expert. Combine disjoint findings into a coherent, non-duplicative outline. "
-    "Organize by themes, then sub-claims, then key evidence (with source names/URLs inline)."
+SYNTH_SYS = (
+    "You are a synthesis expert.\n"
+    "Combine verified findings into a coherent outline:\n"
+    "Themes → sub-claims → key evidence (Source Name, URL)."
 )
 
-def synthesize_outline(question: str, findings_markdown: str, model: str | None = None) -> str:
-    resp = _client.responses.create(
-        model=model or os.getenv("MODEL_SMART", "gpt-4o"),
-        input=[{"role":"system","content":SYSTEM},
-               {"role":"user","content":f"QUESTION:\n{question}\n\nFINDINGS:\n{findings_markdown}\n\nCreate an outline."}],
-        temperature=0.2
+def build_synthesizer() -> Agent:
+    return Agent(
+        name="Synthesis",
+        instructions=SYNTH_SYS,
+        model=model_smart(),
+        tools=[],
     )
-    return resp.output_text
